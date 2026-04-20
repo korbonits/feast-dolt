@@ -2,7 +2,14 @@
 
 Minimal, runnable proof that Dolt's `AS OF '<revision>'` collapses the warehouse-style point-in-time SQL that Feast's offline stores rely on today.
 
-See [`RFC.md`](./RFC.md) for the full write-up. TL;DR: 4 LOC vs 13 LOC, identical results.
+See [`RFC.md`](./RFC.md) for the full write-up. TL;DR:
+
+| Feature views | Dolt `AS OF` | Warehouse `ROW_NUMBER` |
+|:-:|:-:|:-:|
+| 1 | 4 LOC  | 13 LOC |
+| 3 | 13 LOC | 31 LOC |
+
+Identical results in both cases; the gap scales linearly with the number of feature views in the retrieval.
 
 ## Run
 

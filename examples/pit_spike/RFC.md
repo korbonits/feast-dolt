@@ -8,7 +8,14 @@
 
 Propose a new Feast offline-store backend, `feast-dolt`, that uses [Dolt](https://github.com/dolthub/dolt) — the version-controlled SQL database — to deliver point-in-time correctness, training-set reproducibility, and feature-definition lineage as **first-class primitives** of the underlying data layer rather than as application-level conventions.
 
-The central argument is empirical: on the canonical "reproduce the training set as of tag T" query, the Dolt-native approach is **~70% fewer lines of SQL** than the warehouse `ROW_NUMBER()` dedupe pattern Feast ships today, with identical results. The simplification compounds across every feature view in a retrieval.
+The central argument is empirical: on the canonical "reproduce the training set as of tag T" query, the Dolt-native approach is roughly **3× shorter at one feature view and the gap grows linearly with every additional feature view** — because `AS OF` pays a flat one-line cost per FV, whereas the `ROW_NUMBER` pattern pays a multi-line CTE per FV.
+
+| Case        | Dolt `AS OF` | Warehouse `ROW_NUMBER` | Gap    |
+|-------------|:------------:|:----------------------:|:------:|
+| 1 FV        | 4 LOC        | 13 LOC                 | +9     |
+| 3 FVs       | 13 LOC       | 31 LOC                 | +18    |
+
+Both cases produce byte-identical results; parity is asserted in the spike. Real training queries routinely join 5–20 feature views, so the gap at production scale is substantial.
 
 ## Motivation
 
@@ -26,22 +33,22 @@ Dolt addresses all three at the database layer:
 
 ## Spike evidence
 
-A minimal spike under `examples/pit_spike/` creates two parallel tables representing the same feature stream:
+A minimal spike under `examples/pit_spike/` creates three feature views (`customer_profile`, `customer_transactions`, `customer_support`) on the same entity (`customer_id`). For each feature view, two parallel tables represent the same stream two ways:
 
-| Table                     | Shape                              | PIT strategy                         |
-|---------------------------|------------------------------------|--------------------------------------|
-| `customer_features`       | Mutable, 1 row per entity          | Dolt commit history + `AS OF`        |
-| `customer_features_log`   | Append-only, 1 row per (entity, ts)| Application-level `ROW_NUMBER` dedupe|
+| Table                      | Shape                              | PIT strategy                         |
+|----------------------------|------------------------------------|--------------------------------------|
+| `<fv_name>`                | Mutable, 1 row per entity          | Dolt commit history + `AS OF`        |
+| `<fv_name>_log`            | Append-only, 1 row per (entity, ts)| Application-level `ROW_NUMBER` dedupe|
 
-Three daily snapshots are committed (2026-04-01, 04-08, 04-15); the first is tagged `train_2026_04_01` to represent a pinned training run. Both tables contain the same *information*; only the layout and PIT strategy differ.
+Three daily snapshots are committed (2026-04-01, 04-08, 04-15); the first is tagged `train_2026_04_01` to represent a pinned training run. Both families contain the same *information*; only the layout and PIT strategy differ.
 
-### The two queries, side-by-side
+### Single-FV case
 
 **Proposed — Dolt `AS OF` (4 non-blank LOC):**
 
 ```sql
 SELECT customer_id, spend_30d, spend_90d
-  FROM customer_features AS OF 'train_2026_04_01'
+  FROM customer_transactions AS OF 'train_2026_04_01'
  WHERE customer_id IN (1, 2)
  ORDER BY customer_id;
 ```
@@ -54,7 +61,7 @@ WITH latest AS (
            spend_30d,
            spend_90d,
            ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_ts DESC) AS rn
-      FROM customer_features_log
+      FROM customer_transactions_log
      WHERE created_ts <= '2026-04-01 23:59:59'
 )
 SELECT customer_id, spend_30d, spend_90d
@@ -64,20 +71,81 @@ SELECT customer_id, spend_30d, spend_90d
  ORDER BY customer_id;
 ```
 
-Both return:
+Both return `customer 1 → 100/300`, `customer 2 → 50/150` — the day-1 snapshot, not the drifted live values (which are 120/320 and 60/180).
 
-```
- customer_id  spend_30d  spend_90d
-           1      100.0      300.0
-           2       50.0      150.0
+### Multi-FV case (three feature views)
+
+A more realistic retrieval joins features from several feature views onto one entity list. Here we pull profile + transactions + support features for two customers as they were on 2026-04-01:
+
+**Proposed — Dolt `AS OF` (13 non-blank LOC):**
+
+```sql
+WITH entity_df AS (
+    SELECT 1 AS customer_id UNION ALL
+    SELECT 2
+)
+SELECT e.customer_id,
+       p.tier, p.signup_days_ago,
+       t.spend_30d, t.spend_90d,
+       s.tickets_opened_30d, s.last_ticket_sentiment
+  FROM entity_df e
+  LEFT JOIN customer_profile      AS OF 'train_2026_04_01' p ON p.customer_id = e.customer_id
+  LEFT JOIN customer_transactions AS OF 'train_2026_04_01' t ON t.customer_id = e.customer_id
+  LEFT JOIN customer_support      AS OF 'train_2026_04_01' s ON s.customer_id = e.customer_id
+ ORDER BY e.customer_id;
 ```
 
-Meanwhile the live state of `customer_features` — which has drifted since day 1 — reads `120/320` and `60/180`. Without PIT, a naive retrain would silently train on drifted features; both patterns correctly recover the day-1 snapshot.
+**Status quo — warehouse `ROW_NUMBER` dedupe (31 non-blank LOC):**
+
+```sql
+WITH entity_df AS (
+    SELECT 1 AS customer_id UNION ALL
+    SELECT 2
+),
+profile_pit AS (
+    SELECT customer_id, tier, signup_days_ago,
+           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_ts DESC) AS rn
+      FROM customer_profile_log
+     WHERE created_ts <= '2026-04-01 23:59:59'
+),
+transactions_pit AS (
+    SELECT customer_id, spend_30d, spend_90d,
+           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_ts DESC) AS rn
+      FROM customer_transactions_log
+     WHERE created_ts <= '2026-04-01 23:59:59'
+),
+support_pit AS (
+    SELECT customer_id, tickets_opened_30d, last_ticket_sentiment,
+           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_ts DESC) AS rn
+      FROM customer_support_log
+     WHERE created_ts <= '2026-04-01 23:59:59'
+)
+SELECT e.customer_id,
+       p.tier, p.signup_days_ago,
+       t.spend_30d, t.spend_90d,
+       s.tickets_opened_30d, s.last_ticket_sentiment
+  FROM entity_df e
+  LEFT JOIN profile_pit      p ON p.customer_id = e.customer_id AND p.rn = 1
+  LEFT JOIN transactions_pit t ON t.customer_id = e.customer_id AND t.rn = 1
+  LEFT JOIN support_pit      s ON s.customer_id = e.customer_id AND s.rn = 1
+ ORDER BY e.customer_id;
+```
+
+Both return the same day-1 feature row per customer (gold/silver tier, day-1 spend, day-1 support signals — not the drifted day-15 values).
+
+### How the gap scales
+
+| Feature views | Dolt `AS OF` | Warehouse `ROW_NUMBER` | Gap  |
+|:-------------:|:------------:|:----------------------:|:----:|
+| 1             | 4            | 13                     | +9   |
+| 3             | 13           | 31                     | +18  |
+| *N* (modeled) | ~4 + 3·(N−1) | ~13 + 6·(N−1)          | linear in N |
+
+The ROW_NUMBER pattern pays a per-FV tax: each additional feature view adds a full CTE (~6 lines). AS OF pays a flat one-line cost per FV (one additional `LEFT JOIN … AS OF 'tag'` clause). **The gap widens linearly with the number of feature views in a retrieval**, and real production training queries routinely touch 5–20 FVs.
 
 ### Why this matters beyond LOC
 
 - **Conceptual load.** The warehouse template requires the reader to reason about partitions, window ordering, tie-breaking on `created_ts`, and a `WHERE rn = 1` filter. The Dolt template is a `SELECT` with a string literal. New contributors trip over the former; almost no one trips over the latter.
-- **Multi-feature-view scaling.** Feast's real `get_historical_features` joins many feature views. Every feature view gets its own dedupe CTE today. Under Dolt, each feature view is just `FROM fv AS OF '<tag>'`, and the join logic stays linear in the number of feature views rather than multiplying by per-view dedupe boilerplate.
 - **Reproducibility is a tag, not a convention.** `AS OF 'train_2026_04_01'` is either valid and returns exactly the training data, or it fails loudly. There is no silent drift from upstream backfills.
 
 ## Scope
