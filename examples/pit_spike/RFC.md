@@ -2,6 +2,8 @@
 
 **Status:** Draft · **Author:** Alex Korbonits · **Date:** 2026-04-19
 
+**Upstream discussion:** [feast-dev/feast#6297](https://github.com/feast-dev/feast/discussions/6297)
+
 ## Summary
 
 Propose a new Feast offline-store backend, `feast-dolt`, that uses [Dolt](https://github.com/dolthub/dolt) — the version-controlled SQL database — to deliver point-in-time correctness, training-set reproducibility, and feature-definition lineage as **first-class primitives** of the underlying data layer rather than as application-level conventions.
@@ -110,7 +112,7 @@ Meanwhile the live state of `customer_features` — which has drifted since day 
 2. **Done:** the spike in this RFC. See `examples/pit_spike/`.
 3. **Next:** implement `get_historical_features` using `AS OF` + LEFT JOINs across feature views. Test against the toy dataset extended with a multi-feature-view case.
 4. **Then:** `offline_write_batch` with configurable commit granularity; `write_logged_features`.
-5. **RFC upstream:** file this document as a GitHub discussion on `feast-dev/feast` for community feedback before opening a PR that adds `feast-dolt` as a linked community plugin in the docs.
+5. **RFC upstream (done):** filed as [feast-dev/feast Discussion #6297](https://github.com/feast-dev/feast/discussions/6297) under the "Ideas" category on 2026-04-19. Awaiting community feedback before opening a PR that adds `feast-dolt` as a linked community plugin in the docs.
 
 ## Open questions for upstream feedback
 

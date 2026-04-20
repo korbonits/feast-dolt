@@ -4,6 +4,8 @@ A [Feast](https://github.com/feast-dev/feast) plugin that uses [Dolt](https://gi
 
 **Status:** pre-alpha scaffold. Nothing works yet.
 
+**Upstream discussion:** [feast-dev/feast#6297](https://github.com/feast-dev/feast/discussions/6297) — feedback welcome before 0.1.0.
+
 ## Why
 
 Feature stores need point-in-time correctness, training-set reproducibility, and lineage on feature definitions. Existing offline stores bolt these on with timestamp-join logic and external metadata. Dolt provides them natively:
