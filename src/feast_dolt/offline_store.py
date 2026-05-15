@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,6 +49,50 @@ def _engine_from_config(config: DoltOfflineStoreConfig) -> Engine:
 
 def _as_of_clause(config: DoltOfflineStoreConfig) -> str:
     return f" AS OF '{config.as_of}'" if config.as_of else ""
+
+
+def _sql_literal(v: object) -> str:
+    """Render a Python value as a MySQL/Dolt-compatible literal."""
+    if v is None:
+        return "NULL"
+    if isinstance(v, float) and pd.isna(v):
+        return "NULL"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, pd.Timestamp):
+        if pd.isna(v):
+            return "NULL"
+        return f"'{v.isoformat(sep=' ')}'"
+    if isinstance(v, datetime):
+        return f"'{v.isoformat(sep=' ')}'"
+    if isinstance(v, date):
+        return f"'{v.isoformat()}'"
+    s = str(v).replace("\\", "\\\\").replace("'", "''")
+    return f"'{s}'"
+
+
+def _entity_df_to_cte(entity_df: pd.DataFrame | str) -> tuple[str, list[str]]:
+    """
+    Materialize an entity DataFrame as a UNION ALL CTE body.
+
+    Returns (sql_body, columns). For a SQL-string entity_df the caller-provided
+    query is returned as-is and columns is empty (callers must SELECT * from it).
+    """
+    if isinstance(entity_df, str):
+        return entity_df, []
+    if entity_df is None or entity_df.empty:
+        raise ValueError("entity_df must contain at least one row")
+    columns = list(entity_df.columns)
+    rows = entity_df.values.tolist()
+    first = ", ".join(
+        f"{_sql_literal(v)} AS `{c}`" for c, v in zip(columns, rows[0], strict=True)
+    )
+    lines = [f"  SELECT {first}"]
+    for r in rows[1:]:
+        lines.append("  SELECT " + ", ".join(_sql_literal(v) for v in r))
+    return "\n  UNION ALL\n".join(lines), columns
 
 
 class DoltRetrievalJob(RetrievalJob):
@@ -194,15 +238,75 @@ class DoltOfflineStore(OfflineStore):
         project: str,
         full_feature_names: bool = False,
     ) -> RetrievalJob:
-        # SPIKE TARGET: this is where Dolt's `AS OF` should replace the
-        # per-feature-view timestamp-join + ROW_NUMBER dedupe used by
-        # warehouse-backed offline stores. When `config.offline_store.as_of`
-        # is set, reads are already pinned at the revision level, so the
-        # point-in-time join collapses to a regular LEFT JOIN against each
-        # feature view at that revision.
-        raise NotImplementedError(
-            "DoltOfflineStore.get_historical_features is the spike target. "
-            "See README for the AS OF-based design."
+        assert isinstance(config.offline_store, DoltOfflineStoreConfig)
+        if not config.offline_store.as_of:
+            raise ValueError(
+                "DoltOfflineStore.get_historical_features requires `as_of` to be set "
+                "in the offline store config. Pin reads to a Dolt revision "
+                "(branch, tag, commit hash, or timestamp literal); this offline "
+                "store treats training reproducibility as a database primitive, "
+                "not an application-level convention."
+            )
+        if entity_df is None:
+            raise ValueError("entity_df is required")
+
+        as_of = config.offline_store.as_of
+
+        refs_by_fv: dict[str, list[str]] = {}
+        for ref in feature_refs:
+            fv_name, _, feat = ref.partition(":")
+            if not feat:
+                raise ValueError(
+                    f"feature_ref '{ref}' is malformed; expected '<fv_name>:<feature>'."
+                )
+            refs_by_fv.setdefault(fv_name, []).append(feat)
+
+        fv_by_name = {fv.name: fv for fv in feature_views}
+        missing = set(refs_by_fv) - set(fv_by_name)
+        if missing:
+            raise ValueError(
+                f"feature_refs reference unknown feature views: {sorted(missing)}"
+            )
+
+        entity_cte_body, entity_columns = _entity_df_to_cte(entity_df)
+
+        projected: list[str] = [f"e.`{c}`" for c in entity_columns] if entity_columns else ["e.*"]
+        join_lines: list[str] = []
+
+        for i, fv_name in enumerate(refs_by_fv):
+            fv = fv_by_name[fv_name]
+            if not isinstance(fv.batch_source, DoltSource):
+                raise TypeError(
+                    f"feature_view '{fv_name}' is not backed by a DoltSource; "
+                    "DoltOfflineStore only supports DoltSource batch sources."
+                )
+            alias = f"fv{i}"
+            from_str = fv.batch_source.get_table_query_string()
+            join_keys = list(fv.join_keys)
+            if not join_keys:
+                raise ValueError(f"feature_view '{fv_name}' has no join keys")
+            join_cond = " AND ".join(f"{alias}.`{jk}` = e.`{jk}`" for jk in join_keys)
+            join_lines.append(
+                f"  LEFT JOIN {from_str} AS OF '{as_of}' {alias} ON {join_cond}"
+            )
+            field_map = fv.batch_source.field_mapping or {}
+            inverse_map = {v: k for k, v in field_map.items()}
+            for feat in refs_by_fv[fv_name]:
+                source_col = inverse_map.get(feat, feat)
+                out_name = f"{fv_name}__{feat}" if full_feature_names else feat
+                projected.append(f"{alias}.`{source_col}` AS `{out_name}`")
+
+        query = (
+            f"WITH entity_df AS (\n{entity_cte_body}\n)\n"
+            f"SELECT {', '.join(projected)}\n"
+            f"  FROM entity_df e\n"
+            + "\n".join(join_lines)
+        )
+
+        return DoltRetrievalJob(
+            query=query,
+            config=config,
+            full_feature_names=full_feature_names,
         )
 
     @staticmethod
